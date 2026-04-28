@@ -610,7 +610,7 @@ impl Module<Button> for VolumeModule {
                                 .append(&DropdownItem::new(&info.name, &info.description));
 
                             if info.active {
-                                let offset = sink_options.find(&no_sink).is_some() as usize;
+                                let offset = source_options.find(&no_source).is_some() as usize;
                                 source_selector.set_selected((sources.len() + offset) as u32);
                                 source_slider.set_value(info.volume.percent());
 
