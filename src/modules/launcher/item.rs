@@ -5,7 +5,7 @@ use crate::config::{BarPosition, TruncateMode};
 use crate::gtk_helpers::{IronbarGtkExt, IronbarLabelExt, MouseButton};
 use crate::modules::launcher::{ItemEvent, LauncherUpdate};
 use crate::modules::{ModuleUpdateEvent, PopupButton};
-use crate::{image, read_lock};
+use crate::{image, read_lock, write_lock};
 use gtk::prelude::*;
 use gtk::{
     Align, Button, ContentFit, EventControllerMotion, Justification, Label, Orientation, Picture,
@@ -131,7 +131,23 @@ impl From<ToplevelInfo> for Window {
 }
 
 pub struct MenuState {
-    pub num_windows: usize,
+    pub ids: Vec<usize>,
+    pub focus_id: usize,
+}
+
+impl MenuState {
+    fn new(item: &Item) -> Self {
+        let mut focus_id = 0;
+        let mut ids = Vec::with_capacity(item.windows.len());
+        for window in item.windows.values() {
+            if window.open_state.is_open() {
+                focus_id = ids.len();
+            }
+            ids.push(window.id);
+        }
+
+        Self { ids, focus_id }
+    }
 }
 
 #[derive(Clone)]
@@ -197,26 +213,35 @@ impl ItemButton {
         if item.open_state.is_focused() {
             button.add_css_class("focused");
         }
-
-        let menu_state = Rc::new(RwLock::new(MenuState {
-            num_windows: item.windows.len(),
-        }));
+        let window_state = Rc::new(RwLock::new(MenuState::new(item)));
 
         {
             let app_id = item.app_id.clone();
             let tx = controller_tx.clone();
-            let menu_state = menu_state.clone();
+            let menu_state = window_state.clone();
 
             let button2 = button.clone();
             button.connect_pressed(MouseButton::Primary, move || {
                 // lazy check :| TODO: Improve this
                 if button2.has_css_class("open") {
-                    let menu_state = read_lock!(menu_state);
+                    let mut menu_state = write_lock!(menu_state);
 
-                    if button2.has_css_class("focused") && menu_state.num_windows == 1 {
-                        tx.send_spawn(ItemEvent::MinimizeItem(app_id.clone()));
+                    if button2.has_css_class("focused") {
+                        if menu_state.ids.len() == 1 {
+                            tx.send_spawn(ItemEvent::MinimizeItem(app_id.clone()));
+                        } else {
+                            if menu_state.focus_id < menu_state.ids.len() - 1 {
+                                menu_state.focus_id += 1;
+                            } else {
+                                menu_state.focus_id = 0;
+                            }
+
+                            tx.send_spawn(ItemEvent::FocusWindow(
+                                menu_state.ids[menu_state.focus_id],
+                            ));
+                        }
                     } else {
-                        tx.send_spawn(ItemEvent::FocusItem(app_id.clone()));
+                        tx.send_spawn(ItemEvent::FocusWindow(menu_state.ids[menu_state.focus_id]));
                     }
                 } else {
                     tx.send_spawn(ItemEvent::OpenItem(app_id.clone()));
@@ -238,14 +263,14 @@ impl ItemButton {
         {
             let app_id = item.app_id.clone();
             let tx = tx.clone();
-            let menu_state = menu_state.clone();
+            let menu_state = window_state.clone();
 
             let button = button.clone();
 
             event_controller.connect_enter(move |_, _, _| {
                 let menu_state = read_lock!(menu_state);
 
-                if menu_state.num_windows > 1 {
+                if menu_state.ids.len() > 1 {
                     tx.send_update_spawn(LauncherUpdate::Hover(app_id.clone()));
                     tx.send_spawn(ModuleUpdateEvent::OpenPopup(button.popup_id()));
                 } else {
@@ -286,7 +311,7 @@ impl ItemButton {
             button,
             persistent: item.favorite,
             show_names: appearance.show_names,
-            menu_state,
+            menu_state: window_state,
         }
     }
 
@@ -300,6 +325,10 @@ impl ItemButton {
 
     pub fn set_focused(&self, focused: bool) {
         self.update_class("focused", focused);
+    }
+
+    pub fn is_focused(&self) -> bool {
+        self.button.has_css_class("focused")
     }
 
     /// Adds or removes a class to the button based on `toggle`.

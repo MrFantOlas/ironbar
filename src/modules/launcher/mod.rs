@@ -15,7 +15,7 @@ use crate::desktop_file::open_program;
 use crate::gtk_helpers::{IronbarGtkExt, IronbarLabelExt};
 use crate::modules::launcher::item::ImageTextButton;
 use crate::modules::launcher::pagination::{IconContext, Pagination};
-use crate::{arc_mut, lock, module_impl, rc_mut, spawn, write_lock};
+use crate::{arc_mut, lock, module_impl, rc_mut, read_lock, spawn, write_lock};
 use color_eyre::Report;
 use gtk::prelude::*;
 use gtk::{Button, EventControllerMotion, Orientation};
@@ -175,15 +175,14 @@ pub enum LauncherUpdate {
     RemoveWindow(String, usize),
     /// Sets title for `app_id`
     Title(String, usize, String),
-    /// Marks the item with `app_id` as focused or not focused
-    Focus(String, bool),
+    /// Marks the item with `app_id` and `window_id` as focused or not focused
+    Focus(String, usize, bool),
     /// Declares the item with `app_id` has been hovered over
     Hover(String),
 }
 
 #[derive(Debug)]
 pub enum ItemEvent {
-    FocusItem(String),
     FocusWindow(usize),
     OpenItem(String),
     MinimizeItem(String),
@@ -340,6 +339,7 @@ impl Module<gtk::Box> for LauncherModule {
 
                         send_update(LauncherUpdate::Focus(
                             app_id.clone(),
+                            info.id,
                             is_open && info.focused,
                         ))
                         .await?;
@@ -409,7 +409,7 @@ impl Module<gtk::Box> for LauncherModule {
                     let minimize_window = matches!(event, ItemEvent::MinimizeItem(_));
 
                     let id = match event {
-                        ItemEvent::FocusItem(app_id) | ItemEvent::MinimizeItem(app_id) => {
+                        ItemEvent::MinimizeItem(app_id) => {
                             lock!(items).get(&app_id).and_then(|item| {
                                 item.windows
                                     .iter()
@@ -531,7 +531,15 @@ impl Module<gtk::Box> for LauncherModule {
                                 button.set_open(true);
                                 button.set_focused(win.open_state.is_focused());
 
-                                write_lock!(button.menu_state).num_windows += 1;
+                                let mut menu_state = write_lock!(button.menu_state);
+
+                                if !menu_state.ids.contains(&win.id) {
+                                    menu_state.ids.push(win.id);
+                                }
+
+                                if win.open_state.is_focused() {
+                                    menu_state.focus_id = menu_state.ids.len() - 1;
+                                }
                             }
                         }
                         LauncherUpdate::RemoveItem(app_id) => {
@@ -562,17 +570,43 @@ impl Module<gtk::Box> for LauncherModule {
                             debug!("Removing window {win_id} with id {app_id}");
 
                             if let Some(button) = buttons.borrow().get(&app_id) {
+                                let mut menu_state = write_lock!(button.menu_state);
+
                                 button.set_focused(false);
 
-                                let mut menu_state = write_lock!(button.menu_state);
-                                menu_state.num_windows -= 1;
+                                let position = menu_state
+                                    .ids
+                                    .iter()
+                                    .position(|id| *id == win_id)
+                                    .expect("window id must have been stored");
+                                if menu_state.focus_id >= position {
+                                    if menu_state.focus_id == menu_state.ids.len() - 1
+                                        && position != menu_state.ids.len() - 1
+                                    {
+                                        menu_state.focus_id = position
+                                    } else {
+                                        menu_state.focus_id = menu_state.focus_id.saturating_sub(1)
+                                    }
+                                }
+                                menu_state.ids.swap_remove(position);
+                            }
+
+                            if buttons.borrow().len() <= page_size {
+                                pagination.set_visible(false);
                             }
                         }
-                        LauncherUpdate::Focus(app_id, focus) => {
+                        LauncherUpdate::Focus(app_id, win_id, focus) => {
                             debug!("Changing focus to {} on item with id {}", focus, app_id);
 
                             if let Some(button) = buttons.borrow().get(&app_id) {
-                                button.set_focused(focus);
+                                let menu_state = read_lock!(button.menu_state);
+
+                                if (menu_state.ids[menu_state.focus_id] == win_id
+                                    && button.is_focused())
+                                    || !button.is_focused()
+                                {
+                                    button.set_focused(focus);
+                                }
                             }
                         }
                         LauncherUpdate::Title(app_id, _, name) => {
